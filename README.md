@@ -38,7 +38,9 @@ weights once, never trains and never mutates them, so each isolate is read-only
 and stateless, which is what makes running N of them trivial.
 
 `bin/bench_matmul.dart` and `bin/load_test.dart` are measurement tools.
-`compare/numpy_baseline.py` is the same experiment in NumPy.
+`compare/numpy_baseline.py` is the same experiment in NumPy. `experiments/`
+holds the follow-up experiments; nothing in `lib/` or `bin/` depends on it, and
+it is the only place that uses `dart:ffi`.
 
 ### Key decisions
 
@@ -243,8 +245,8 @@ SDK on the target machine.
   apart at 512. Under JIT the gap is 1.14–1.39×. I expected several-fold. The
   likely reason is that a 512 × 512 Float64 matrix is 2 MB and fits comfortably
   in this CPU's cache, and the prefetcher copes with a fixed column stride. The
-  effect should appear at sizes that overflow the cache; I did not measure
-  beyond 512, so that is a prediction.
+  effect should appear at sizes that overflow the cache. The follow-up
+  experiments below confirm it: the gap is 1.3× at 1024 and 4.3× at 2048.
 - **Dart matmul is flat at about 2 GFLOPS at every size.** It neither speeds up
   nor slows down between n = 32 and n = 512. That is one multiply-add per
   nanosecond: scalar code with no SIMD and no loop unrolling. A side experiment
@@ -290,17 +292,172 @@ SDK on the target machine.
   short-lived matrices per batch; that did not show up as a problem at this
   size but was not profiled.
 
+## Follow-up experiments
+
+All code is in `experiments/`; `lib/`, `bin/` and `test/` are unchanged from the
+baseline above. Same machine, same day, same load caveat. AOT numbers are from
+two runs unless stated; JIT from one.
+
+```bash
+dart test experiments/test                 # 16 tests
+dart run experiments/bench_kernels.dart    # 1, 2, 7 (takes about a minute)
+dart run experiments/bench_adam.dart       # 3
+dart run experiments/bench_binary.dart     # 4 (needs model.json)
+dart run experiments/bench_ffi_blas.dart   # 6 (macOS only)
+```
+
+### 1, 2, 7: Float32, SIMD and larger sizes
+
+Single-thread GFLOPS, AOT, first run (the second was within 7%):
+
+| n | f64 naive | f64 i-k-j (baseline) | f64x2 SIMD † | f32 scalar | f32x4 SIMD | i-k-j vs naive | f32x4 vs f64 |
+|---|---|---|---|---|---|---|---|
+| 32 | 2.05 | 2.05 | 3.67 | 1.88 | 6.44 | 1.00× | 3.15× |
+| 64 | 2.12 | 2.10 | 3.57 | 1.92 | 7.09 | 0.99× | 3.37× |
+| 128 | 2.08 | 2.04 | 3.60 | 1.86 | 7.17 | 0.98× | 3.52× |
+| 256 | 2.13 | 2.09 | 3.56 | 1.88 | 7.40 | 0.98× | 3.54× |
+| 512 | 1.86 | 2.11 | 3.62 | 1.90 | 7.39 | 1.14× | 3.50× |
+| 1024 | 1.66 | 2.11 | 3.64 | 1.91 | 7.29 | 1.28× | 3.45× |
+| 2048 | 0.50 | 2.16 | 3.65 | 1.92 | 7.43 | 4.28× | 3.44× |
+
+† Extra, not on the original list.
+
+Under JIT the SIMD kernels are noticeably slower than under AOT: f32x4 reaches
+4.4–4.8 GFLOPS and f64x2 2.5–2.6, while the scalar kernels are about the same.
+
+- **Float32 alone does nothing (experiment 1).** Scalar Float32 is 1.9 GFLOPS
+  against 2.1 for Float64, about 10% *slower* under AOT, at every size including
+  2048. Dart has no single-precision arithmetic: each element is widened to a
+  double, multiplied, and narrowed again on the store. Halving memory traffic
+  does not help because this loop was never limited by memory.
+- **`Float32x4` works (experiment 2).** 7.4 GFLOPS, 3.5× the baseline, in pure
+  Dart. It is close to the 4× the lane count suggests and is flat across sizes.
+  It costs precision (results agree with Float64 to about 1e-4 in the tests)
+  and requires the column count to be a multiple of 4.
+- **`Float64x2` gives 1.7× with no loss of precision**; its results are
+  bit-identical to `Matrix.matmul`. It needs an even column count, so the
+  64-wide hidden layers qualify and the 3-wide output layer does not.
+- **The loop-order effect appears at 2048 (experiment 7).** Naive i-j-k falls
+  from about 2 GFLOPS to 0.50, while i-k-j holds at 2.16: a 4.3× gap, against
+  1.3× at 1024 and nothing at 256 and below. A 2048 × 2048 Float64 matrix is
+  32 MB, so this is the point where the operands no longer fit in cache.
+  i-k-j is the right default; it just was not needed at the sizes this model
+  uses.
+- Even the best pure-Dart kernel is still about 45× short of BLAS at n = 512.
+
+I did not wire a SIMD kernel into `MLP`, so there is no end-to-end training or
+inference number for it. Training time is matmul-bound, so a gain close to the
+kernel's is likely, but that is an inference, not a measurement.
+
+### 3: Adam
+
+Same data, split, init seed, batch size and shuffle seed as `bin/train.dart`.
+Targets are checked at the end of each epoch; times exclude evaluation. Both
+runs gave identical epochs and losses; times are from the first.
+
+| Optimizer | Loss ≤ 0.05 | Loss ≤ 0.02 | Test ≥ 97% | Final loss (400 ep) | Final test | ms/epoch |
+|---|---|---|---|---|---|---|
+| SGD, lr 0.2 (baseline) | 28 ep / 285 ms | 123 ep / 1,260 ms | 11 ep / 120 ms | 0.014706 | 98.89% | 10.2 |
+| Adam, lr 0.001 | 36 ep / 367 ms | 87 ep / 894 ms | 17 ep / 176 ms | 0.004533 | 98.33% | 10.2 |
+| Adam, lr 0.003 | 14 ep / 139 ms | 36 ep / 361 ms | 8 ep / 79 ms | 0.005018 | 98.89% | 10.1 |
+| Adam, lr 0.01 | 7 ep / 71 ms | 18 ep / 185 ms | 4 ep / 41 ms | 0.014094 | 98.89% | 10.3 |
+| Adam, lr 0.03 | 4 ep / 41 ms | 14 ep / 144 ms | 4 ep / 41 ms | 0.010068 | 98.33% | 10.1 |
+
+- **Adam costs nothing extra per epoch.** The update touches 4,547 parameters;
+  the matmuls dominate. So fewer epochs translates directly into less wall time.
+- **With a tuned step size Adam is 4–9× faster to a given loss.** At lr 0.01 it
+  reaches loss ≤ 0.02 in 185 ms against 1,260 ms for SGD (6.8×).
+- **At the paper's default lr of 0.001 Adam is not clearly better.** It is
+  slower than SGD to loss ≤ 0.05 and to 97% test accuracy, and faster only to
+  the tighter loss target. The SGD baseline at lr 0.2 was already well tuned
+  for this problem.
+- **Final test accuracy is the same within noise** (98.33–98.89%, a difference
+  of one test point). Adam drives training loss lower, but on 180 test points
+  that does not show up as better accuracy.
+
+### 4: Binary serialization
+
+In-memory encode and decode, AOT. The format is a 16-byte header, the layer
+sizes, then raw little-endian parameters.
+
+| Model | Format | Size | Bytes/param | Encode ms | Decode ms |
+|---|---|---|---|---|---|
+| Trained, 4,547 params | JSON | 89.9 KB | 20.3 | 1.06 | 0.51 |
+| | binary Float64 | 35.6 KB | 8.0 | 0.0016 | 0.025 |
+| | binary Float32 † | 17.8 KB | 4.0 | 0.0047 | 0.025 |
+| `[784, 512, 512, 10]`, 669,706 params | JSON | 13.6 MB | 20.8 | 193 | 74 |
+| | binary Float64 | 5.2 MB | 8.0 | 0.41 | 3.9 |
+| | binary Float32 † | 2.6 MB | 4.0 | 0.76 | 4.0 |
+
+† Extra, not on the original list.
+
+- **Binary Float64 is 2.6× smaller, about 20× faster to load and several
+  hundred times faster to write**, and lossless: predictions are bit-identical.
+- **Float32 halves the size again** and changes predicted probabilities by at
+  most 2e-7 on the trained model.
+- **For this model it does not matter.** Loading the 90 KB JSON takes half a
+  millisecond, against a 25 ms cold start. It starts to matter at the larger
+  size, where JSON takes 74 ms to load.
+- The binary decoder is slower than it needs to be: it builds the model through
+  `MLP.fromJson`, which copies and checks every element, because `lib/` was
+  left untouched and has no other public way to construct a model from existing
+  parameters. I did not measure how much of the 3.9 ms that accounts for.
+
+### 6: FFI to BLAS
+
+`cblas_dgemm` from Apple Accelerate through `dart:ffi`, with no extra package.
+This deliberately breaks the pure-Dart rule. "BLAS + copy" takes and returns
+ordinary `Matrix` objects, copying in and out of native memory on each call;
+"BLAS" keeps the buffers in native memory. AOT, first run; microseconds per
+call.
+
+| n | Pure Dart µs | BLAS + copy µs | BLAS µs | Pure Dart GFLOPS | BLAS + copy GFLOPS | BLAS GFLOPS |
+|---|---|---|---|---|---|---|
+| 2 | 0.049 | 0.258 | 0.053 | 0.32 | 0.06 | 0.30 |
+| 4 | 0.138 | 0.221 | 0.067 | 0.93 | 0.58 | 1.92 |
+| 8 | 0.594 | 0.312 | 0.123 | 1.72 | 3.28 | 8.31 |
+| 16 | 4.24 | 0.739 | 0.361 | 1.93 | 11.1 | 22.7 |
+| 32 | 31.3 | 1.69 | 0.578 | 2.09 | 38.9 | 113 |
+| 64 | 250 | 5.00 | 2.20 | 2.09 | 105 | 238 |
+| 128 | 2,054 | 24.5 | 13.4 | 2.04 | 171 | 312 |
+| 256 | 16,010 | 162 | 95.2 | 2.10 | 207 | 352 |
+| 512 | 126,939 | 1,072 | 822 | 2.11 | 250 | 327 |
+| 1024 | not run | 7,346 | 6,114 | not run | 292 | 351 |
+| 2048 | not run | 56,357 | 51,480 | not run | 305 | 334 |
+
+- **The gap to NumPy is the library, not the language.** Dart calling
+  Accelerate reaches 330–350 GFLOPS at 256 and above, the same as NumPy's
+  343–357 on the same machine. JIT and AOT give the same figures.
+- **FFI overhead is tiny.** A call costs about 50 ns. With native buffers BLAS
+  is ahead of pure Dart from n = 4; through the copying `Matrix` API it is ahead
+  from n = 8. At n = 2 pure Dart ties the native-buffer call and beats the
+  copying one.
+- **The copies cost up to half the throughput at mid sizes** (105 against 238
+  GFLOPS at n = 64) and under 10% at 2048. A serious FFI-backed `Matrix` would
+  keep its data in native memory.
+- **It is faster than NumPy at small sizes**: 113 GFLOPS at n = 32 against
+  NumPy's 50, since Dart's call path into BLAS is shorter than NumPy's.
+- The price is everything the pure-Dart version gave for free: this file is
+  macOS-only, manages memory by hand, and would need a different library on
+  every other platform, including each Flutter target.
+
+### What the follow-ups change in the verdict
+
+Pure Dart can be pushed from 2 to about 7 GFLOPS with `Float32x4`, and Adam
+cuts training time several-fold, so the pure-Dart story is better than the
+baseline suggested, but it remains one thread and roughly 45× behind BLAS.
+The FFI result is the more important one: with a native BLAS underneath, Dart
+matches NumPy at large sizes and beats it at small ones. The honest summary is
+that Dart the language is not the obstacle; the missing numeric library is.
+
 ## Next experiments
 
-1. **Float32 vs Float64**: halve memory traffic and see whether throughput moves.
-2. **SIMD with `Float32x4`**: the most direct attack on the 2 GFLOPS ceiling
-   that stays within pure Dart.
-3. **Adam optimizer**: fewer epochs to the same accuracy, measured in wall time.
-4. **Binary serialization**: raw little-endian `Float64List` bytes instead of JSON.
-5. **On-device inference in Flutter**: reuse `lib/` and `model.json` in an app
-   and measure latency on a phone.
-6. **FFI to BLAS as a contrast**: the same `Matrix` API backed by Accelerate or
-   OpenBLAS, to see how much of the gap is the language and how much is the
-   library.
-7. **Larger matmul sizes (1024, 2048)**: find where the loop-order effect
-   actually appears on this CPU.
+1. **On-device inference in Flutter** (experiment 5 from the original list,
+   not done): reuse `lib/` and `model.json` in an app and measure latency on a
+   phone.
+2. **Wire a SIMD kernel into `MLP`** and measure training and inference end to
+   end, rather than inferring it from the kernel benchmark.
+3. **Multi-isolate matmul**: split rows across isolates to see how close pure
+   Dart gets to BLAS when it is also allowed every core.
+4. **A public `MLP.fromParameters` constructor** so the binary decoder can skip
+   the `fromJson` copy.
